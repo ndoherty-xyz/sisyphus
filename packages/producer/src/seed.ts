@@ -29,8 +29,12 @@ async function seed() {
     .insert(shops)
     .values({ name: "Gadget Galaxy" })
     .returning();
+  const [shop4] = await db
+    .insert(shops)
+    .values({ name: "Dead Endpoint Inc" })
+    .returning();
 
-  console.log("created shops:", shop1.id, shop2.id, shop3.id);
+  console.log("created shops:", shop1.id, shop2.id, shop3.id, shop4.id);
 
   await db.insert(webhookRegistrations).values([
     {
@@ -64,23 +68,26 @@ async function seed() {
       events: ["order.created"],
       secret: randomBytes(32).toString("hex"),
     },
+    {
+      shopId: shop4.id,
+      targetUrl: "http://localhost:3001/webhook?name=dead-endpoint&status=500",
+      events: ["order.created"],
+      secret: randomBytes(32).toString("hex"),
+    },
   ]);
 
   console.log("created webhook registrations");
-  console.log(
-    "\nshop1 (Acme Corp):",
-    shop1.id,
-    "- 2 registrations, both get order.created + order.updated"
-  );
-  console.log(
-    "shop2 (Widget World):",
-    shop2.id,
-    "- 1 registration, only order.created"
-  );
+  console.log("\nshop1 (Acme Corp):", shop1.id, "- 2 registrations, reliable");
+  console.log("shop2 (Widget World):", shop2.id, "- 1 registration, reliable");
   console.log(
     "shop3 (Gadget Galaxy):",
     shop3.id,
-    "- 2 registrations, one will fail 50% of the time"
+    "- 1 good, 1 flaky (50% fail)"
+  );
+  console.log(
+    "shop4 (Dead Endpoint Inc):",
+    shop4.id,
+    "- always fails 500, will trip circuit breaker"
   );
   console.log("\ndone!");
 

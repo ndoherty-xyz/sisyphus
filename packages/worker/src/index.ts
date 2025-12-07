@@ -1,4 +1,4 @@
-import { Worker, Job } from "bullmq";
+import { Worker, Job, DelayedError } from "bullmq";
 import {
   db,
   events,
@@ -6,15 +6,29 @@ import {
   deliveryAttempts,
   redisConnection,
   WEBHOOK_QUEUE,
+  MAX_RETRIES,
+  redis,
   type WebhookJobData,
+  CIRCUIT_COOLDOWN_MS,
+  CIRCUIT_TIME_LIMIT_MS,
+  CIRCUIT_ERROR_LIMIT,
 } from "@sisyphus/shared";
-import { and, eq } from "drizzle-orm";
-import { MAX_RETRIES } from "@sisyphus/shared/dist/queue/connection";
+import { and, eq, gt, or } from "drizzle-orm";
 
-async function processWebhook(job: Job<WebhookJobData>) {
+async function processWebhook(
+  job: Job<WebhookJobData>,
+  token: string | undefined
+) {
   const { eventId, shopId, registrationId } = job.data;
 
   console.log(`processing job ${job.id} for event ${eventId}`);
+
+  const circuitOpen = await redis.exists(`circuit:open:${registrationId}`);
+  if (circuitOpen === 1) {
+    await job.moveToDelayed(Date.now() + CIRCUIT_COOLDOWN_MS, token);
+    console.log(`circuit open for ${registrationId}, delaying job`);
+    throw new DelayedError(`circuit open for ${registrationId}, delaying job`);
+  }
 
   const [event] = await db.select().from(events).where(eq(events.id, eventId));
 
@@ -111,6 +125,11 @@ async function deliverWebhook(
       })
       .where(eq(deliveryAttempts.id, attempt.id));
 
+    const recentFailCount = await incrementFailCount(registration.id);
+    if (recentFailCount >= CIRCUIT_ERROR_LIMIT) {
+      await openCircuitForRegistration(registration.id);
+    }
+
     throw new Error(`delivery error: ${errMessage}`);
   }
 
@@ -128,6 +147,11 @@ async function deliverWebhook(
       })
       .where(eq(deliveryAttempts.id, attempt.id));
 
+    const recentFailCount = await incrementFailCount(registration.id);
+    if (recentFailCount >= CIRCUIT_ERROR_LIMIT) {
+      await openCircuitForRegistration(registration.id);
+    }
+
     throw new Error(`delivery failed with status ${response.status}`);
   } else {
     await db
@@ -142,6 +166,29 @@ async function deliverWebhook(
       .where(eq(deliveryAttempts.id, attempt.id));
   }
   console.log(`delivered successfully to ${registration.targetUrl}`);
+}
+
+async function incrementFailCount(registrationId: string): Promise<number> {
+  const failCount = await redis.incr(`circuit:failures:${registrationId}`);
+  const ttl = await redis.ttl(`circuit:failures:${registrationId}`);
+  if (ttl === -1) {
+    await redis.expire(
+      `circuit:failures:${registrationId}`,
+      CIRCUIT_TIME_LIMIT_MS / 1000
+    );
+  }
+
+  return failCount;
+}
+
+async function openCircuitForRegistration(registrationId: string) {
+  console.log(`circuit breaker tripped for registration ${registrationId}`);
+  await redis.set(
+    `circuit:open:${registrationId}`,
+    "1",
+    "EX",
+    CIRCUIT_COOLDOWN_MS / 1000
+  );
 }
 
 const worker = new Worker<WebhookJobData>(WEBHOOK_QUEUE, processWebhook, {
