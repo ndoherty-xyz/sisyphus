@@ -6,6 +6,7 @@ import {
   createWebhookQueue,
 } from "@sisyphus/shared";
 import { randomUUID } from "crypto";
+import { eq } from "drizzle-orm";
 
 const queue = createWebhookQueue();
 
@@ -40,15 +41,24 @@ async function produceEvent(shopId: string) {
     })
     .returning();
 
-  console.log(`created event ${event.id} for shop ${shopId}`);
+  const registrations = await db
+    .select()
+    .from(webhookRegistrations)
+    .where(eq(webhookRegistrations.shopId, shopId))
+    .execute();
 
-  await queue.add("webhook-delivery", {
-    eventId: event.id,
-    shopId: event.shopId,
-  });
-
-  console.log(`queued job for event ${event.id}`);
-
+  for (const registration of registrations) {
+    if (registration.events.includes(event.eventType)) {
+      await queue.add("webhook-delivery", {
+        eventId: event.id,
+        shopId: registration.shopId,
+        registrationId: registration.id,
+      });
+      console.log(
+        `queued job for event ${event.id} and registration ${registration.id}`
+      );
+    }
+  }
   return event;
 }
 

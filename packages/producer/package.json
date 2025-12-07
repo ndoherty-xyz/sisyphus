@@ -12,7 +12,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@sisyphus/shared": "workspace:*"
+    "@sisyphus/shared": "workspace:*",
+    "drizzle-orm": "^0.45.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

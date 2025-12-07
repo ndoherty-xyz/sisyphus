@@ -8,10 +8,10 @@ import {
   WEBHOOK_QUEUE,
   type WebhookJobData,
 } from "@sisyphus/shared";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 
 async function processWebhook(job: Job<WebhookJobData>) {
-  const { eventId, shopId } = job.data;
+  const { eventId, shopId, registrationId } = job.data;
 
   console.log(`processing job ${job.id} for event ${eventId}`);
 
@@ -22,24 +22,28 @@ async function processWebhook(job: Job<WebhookJobData>) {
     return;
   }
 
-  const registrations = await db
+  const [registration] = await db
     .select()
     .from(webhookRegistrations)
-    .where(
-      and(
-        eq(webhookRegistrations.shopId, shopId),
-        eq(webhookRegistrations.active, true)
-      )
+    .where(eq(webhookRegistrations.id, registrationId));
+
+  // registration not found, skip
+  if (!registration) {
+    console.warn(
+      `received job for event ${event.id} but registration ${registrationId} doesn't exist - skipping`
     );
-  const relevantRegistrations = registrations.filter((reg) =>
-    reg.events.includes(event.eventType)
-  );
-
-  console.log(`found ${relevantRegistrations.length} webhook(s) to deliver to`);
-
-  for (const registration of relevantRegistrations) {
-    await deliverWebhook(event, registration);
+    return;
   }
+
+  if (!registration.events.includes(event.eventType)) {
+    // should not happen, producer should not add to the queue. warn
+    console.warn(
+      `received job for event type ${event.eventType} but registration ${registration.id} doesn't subscribe to it - skipping`
+    );
+    return;
+  }
+
+  await deliverWebhook(event, registration);
 }
 
 async function deliverWebhook(
