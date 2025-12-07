@@ -8,7 +8,8 @@ import {
   WEBHOOK_QUEUE,
   type WebhookJobData,
 } from "@sisyphus/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { MAX_RETRIES } from "@sisyphus/shared/dist/queue/connection";
 
 async function processWebhook(job: Job<WebhookJobData>) {
   const { eventId, shopId, registrationId } = job.data;
@@ -52,27 +53,42 @@ async function deliverWebhook(
 ) {
   console.log(`delivering to ${registration.targetUrl}`);
 
-  // create delivery attempt record first (pending state)
-  const [attempt] = await db
-    .insert(deliveryAttempts)
-    .values({
-      eventId: event.id,
-      webhookRegistrationId: registration.id,
-      status: "pending",
-      attempts: 1,
-    })
-    .returning();
+  let attempt: typeof deliveryAttempts.$inferSelect;
 
+  const existingAttempt = await db.query.deliveryAttempts.findFirst({
+    where: and(
+      eq(deliveryAttempts.eventId, event.id),
+      eq(deliveryAttempts.webhookRegistrationId, registration.id)
+    ),
+  });
+
+  if (existingAttempt) {
+    attempt = existingAttempt;
+  } else {
+    // create delivery attempt record first (pending state)
+    const [newAttempt] = await db
+      .insert(deliveryAttempts)
+      .values({
+        eventId: event.id,
+        webhookRegistrationId: registration.id,
+        status: "pending",
+        attempts: 0,
+      })
+      .returning();
+    attempt = newAttempt;
+  }
+
+  const payload = {
+    id: event.id,
+    type: event.eventType,
+    shopId: event.shopId,
+    createdAt: event.createdAt,
+    data: event.payload,
+  };
+
+  let response: Response;
   try {
-    const payload = {
-      id: event.id,
-      type: event.eventType,
-      shopId: event.shopId,
-      createdAt: event.createdAt,
-      data: event.payload,
-    };
-
-    const response = await fetch(registration.targetUrl, {
+    response = await fetch(registration.targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -81,36 +97,51 @@ async function deliverWebhook(
       },
       body: JSON.stringify(payload),
     });
+  } catch (error) {
+    const errMessage = error instanceof Error ? error.message : "unknown error";
+    const newAttempts = attempt.attempts + 1;
 
     await db
       .update(deliveryAttempts)
       .set({
-        status: response.ok ? "success" : "failed",
+        status: newAttempts === MAX_RETRIES ? "dead" : "failed",
+        responseBody: errMessage,
+        lastAttemptAt: new Date(),
+        attempts: newAttempts,
+      })
+      .where(eq(deliveryAttempts.id, attempt.id));
+
+    throw new Error(`delivery error: ${errMessage}`);
+  }
+
+  const newAttempts = attempt.attempts + 1;
+
+  if (!response.ok) {
+    await db
+      .update(deliveryAttempts)
+      .set({
+        status: newAttempts === MAX_RETRIES ? "dead" : "failed",
         responseCode: response.status,
         responseBody: await response.text(),
         lastAttemptAt: new Date(),
+        attempts: newAttempts,
       })
       .where(eq(deliveryAttempts.id, attempt.id));
 
-    if (response.ok) {
-      console.log(`delivered successfully to ${registration.targetUrl}`);
-    } else {
-      console.log(`delivery failed with status ${response.status}`);
-    }
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "unknown error";
-
+    throw new Error(`delivery failed with status ${response.status}`);
+  } else {
     await db
       .update(deliveryAttempts)
       .set({
-        status: "failed",
-        responseBody: errMessage,
+        status: "success",
+        responseCode: response.status,
+        responseBody: await response.text(),
         lastAttemptAt: new Date(),
+        attempts: newAttempts,
       })
       .where(eq(deliveryAttempts.id, attempt.id));
-
-    console.error(`delivery error: ${errMessage}`);
   }
+  console.log(`delivered successfully to ${registration.targetUrl}`);
 }
 
 const worker = new Worker<WebhookJobData>(WEBHOOK_QUEUE, processWebhook, {

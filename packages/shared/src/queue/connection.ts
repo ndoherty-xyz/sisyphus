@@ -6,7 +6,18 @@ export const redisConnection: ConnectionOptions = {
 };
 
 export const WEBHOOK_QUEUE = "webhook-delivery";
+export const MAX_RETRIES = 5;
 
 export function createWebhookQueue() {
-  return new Queue(WEBHOOK_QUEUE, { connection: redisConnection });
+  return new Queue(WEBHOOK_QUEUE, {
+    connection: redisConnection,
+    defaultJobOptions: {
+      attempts: MAX_RETRIES,
+      backoff: {
+        type: "exponential",
+        delay: 2000,
+        jitter: 0.2,
+      },
+    },
+  });
 }
