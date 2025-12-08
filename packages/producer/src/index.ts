@@ -4,6 +4,10 @@ import {
   shops,
   webhookRegistrations,
   createWebhookQueue,
+  WebhookJobData,
+  getOrCreateShopQueue,
+  redis,
+  ACTIVE_SHOP_QUEUES_KEY,
 } from "@sisyphus/shared";
 import { randomUUID } from "crypto";
 import { eq } from "drizzle-orm";
@@ -31,6 +35,15 @@ function generateFakeOrder() {
   };
 }
 
+async function addEventToShopQueue(event: WebhookJobData) {
+  const queue = getOrCreateShopQueue(event.shopId);
+  await queue.add("webhook-delivery", event);
+  await redis.sadd(ACTIVE_SHOP_QUEUES_KEY, event.shopId);
+  console.log(
+    `queued job for event ${event.eventId}, shop ${event.shopId} and registration ${event.registrationId}`
+  );
+}
+
 async function produceEvent(shopId: string) {
   const [event] = await db
     .insert(events)
@@ -49,14 +62,11 @@ async function produceEvent(shopId: string) {
 
   for (const registration of registrations) {
     if (registration.events.includes(event.eventType)) {
-      await queue.add("webhook-delivery", {
+      await addEventToShopQueue({
         eventId: event.id,
         shopId: registration.shopId,
         registrationId: registration.id,
       });
-      console.log(
-        `queued job for event ${event.id} and registration ${registration.id}`
-      );
     }
   }
   return event;

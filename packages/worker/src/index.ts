@@ -1,17 +1,20 @@
-import { Worker, Job, DelayedError } from "bullmq";
+import { Job, DelayedError } from "bullmq";
 import {
   db,
   events,
   webhookRegistrations,
   deliveryAttempts,
-  redisConnection,
-  WEBHOOK_QUEUE,
   MAX_RETRIES,
   redis,
   type WebhookJobData,
   CIRCUIT_COOLDOWN_MS,
   CIRCUIT_TIME_LIMIT_MS,
   CIRCUIT_ERROR_LIMIT,
+  ACTIVE_SHOP_QUEUES_KEY,
+  getOrCreateShopWorker,
+  getOrCreateShopQueue,
+  updateLatestActivityForWorker,
+  cleanupStaleWorkers,
 } from "@sisyphus/shared";
 import { and, eq, gt, or } from "drizzle-orm";
 
@@ -110,6 +113,7 @@ async function deliverWebhook(
         "X-Webhook-Type": event.eventType,
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000), // 10 second timeout
     });
   } catch (error) {
     const errMessage = error instanceof Error ? error.message : "unknown error";
@@ -191,16 +195,59 @@ async function openCircuitForRegistration(registrationId: string) {
   );
 }
 
-const worker = new Worker<WebhookJobData>(WEBHOOK_QUEUE, processWebhook, {
-  connection: redisConnection,
-});
+async function runWorker() {
+  console.log("worker started, waiting for jobs...");
 
-worker.on("completed", (job) => {
-  console.log(`job ${job.id} completed`);
-});
+  let currentIteration = 0;
+  const workerToken = "worker-1"; // will need to update token for multiple workers
 
-worker.on("failed", (job, err) => {
-  console.error(`job ${job?.id} failed:`, err.message);
-});
+  while (true) {
+    const activeShops = await redis.smembers(ACTIVE_SHOP_QUEUES_KEY);
 
-console.log("worker started, waiting for jobs...");
+    if (activeShops.length === 0) {
+      // simple sleep while waiting for active jobs
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      continue;
+    }
+
+    const shopId = activeShops[currentIteration % activeShops.length];
+    const worker = getOrCreateShopWorker(shopId);
+    let job = await worker.getNextJob(workerToken, {});
+
+    if (!job) {
+      const queue = getOrCreateShopQueue(shopId);
+      const counts = await queue.getJobCounts("waiting", "active", "delayed");
+      if (counts.waiting === 0 && counts.active === 0 && counts.delayed === 0) {
+        await redis.srem(ACTIVE_SHOP_QUEUES_KEY, shopId);
+      }
+      continue;
+    } else {
+      updateLatestActivityForWorker(shopId, Date.now());
+
+      try {
+        const result = await processWebhook(job, workerToken);
+        await job.moveToCompleted(result, workerToken, false);
+      } catch (e: unknown) {
+        if (e instanceof DelayedError) {
+          // skip, this job has been delayed
+          continue;
+        } else {
+          const err =
+            e instanceof Error
+              ? e
+              : new Error(`Job ${job.id} failed unexpectedly`);
+          await job.moveToFailed(err, workerToken, false);
+        }
+      }
+    }
+
+    // run cleanup every 100 iterations
+    if (currentIteration % 100 === 0) {
+      cleanupStaleWorkers();
+    }
+
+    currentIteration++;
+  }
+}
+
+runWorker();
