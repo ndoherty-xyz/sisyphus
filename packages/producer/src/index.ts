@@ -2,15 +2,12 @@ import {
   db,
   events,
   shops,
-  webhookRegistrations,
   createWebhookQueue,
-  WebhookJobData,
-  getOrCreateShopQueue,
-  redis,
-  ACTIVE_SHOP_QUEUES_KEY,
+  addEventToQueue,
+  checkGlobalBackpressureAndUpdateIfStale,
+  checkTenantQueueBackpressure,
 } from "@sisyphus/shared";
 import { randomUUID } from "crypto";
-import { eq } from "drizzle-orm";
 
 const queue = createWebhookQueue();
 
@@ -35,41 +32,42 @@ function generateFakeOrder() {
   };
 }
 
-async function addEventToShopQueue(event: WebhookJobData) {
-  const queue = getOrCreateShopQueue(event.shopId);
-  await queue.add("webhook-delivery", event);
-  await redis.sadd(ACTIVE_SHOP_QUEUES_KEY, event.shopId);
-  console.log(
-    `queued job for event ${event.eventId}, shop ${event.shopId} and registration ${event.registrationId}`
-  );
-}
-
-async function produceEvent(shopId: string) {
-  const [event] = await db
+async function queueEvent(
+  event: Omit<typeof events.$inferSelect, "id" | "createdAt" | "queuedAt">
+) {
+  const [dbEvent] = await db
     .insert(events)
     .values({
-      shopId,
-      eventType: "order.created",
-      payload: generateFakeOrder(),
+      ...event,
+      queuedAt: null,
     })
     .returning();
 
-  const registrations = await db
-    .select()
-    .from(webhookRegistrations)
-    .where(eq(webhookRegistrations.shopId, shopId))
-    .execute();
-
-  for (const registration of registrations) {
-    if (registration.events.includes(event.eventType)) {
-      await addEventToShopQueue({
-        eventId: event.id,
-        shopId: registration.shopId,
-        registrationId: registration.id,
-      });
-    }
+  if (await checkGlobalBackpressureAndUpdateIfStale()) {
+    // global backpressure, skip
+    console.log(
+      `global backpressure active, skipping queue for event ${dbEvent.id}`
+    );
+    return;
   }
-  return event;
+
+  if (await checkTenantQueueBackpressure(dbEvent.shopId)) {
+    // tenant backpressure, skip
+    console.log(
+      `tenant backpressure active for shop ${dbEvent.shopId}, skipping queue for event ${dbEvent.id}`
+    );
+    return;
+  }
+
+  await addEventToQueue(dbEvent);
+}
+
+async function produceEvent(shopId: string) {
+  await queueEvent({
+    shopId,
+    eventType: "order.created",
+    payload: generateFakeOrder(),
+  });
 }
 
 async function main() {

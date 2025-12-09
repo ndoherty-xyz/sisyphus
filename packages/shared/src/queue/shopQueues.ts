@@ -1,5 +1,5 @@
 import { Queue } from "bullmq";
-import { MAX_RETRIES, redisConnection } from "./connection";
+import { MAX_RETRIES, redis, redisConnection } from "./connection";
 import { WebhookJobData } from "../types";
 
 export const ACTIVE_SHOP_QUEUES_KEY = "activeShopQueues";
@@ -29,4 +29,22 @@ export function getOrCreateShopQueue(shopId: string): Queue<WebhookJobData> {
   } else {
     return cachedQueue;
   }
+}
+
+export async function getShopQueueDepth(shopId: string): Promise<number> {
+  const shopQueue = getOrCreateShopQueue(shopId);
+  const counts = await shopQueue.getJobCounts("waiting", "active", "delayed");
+  return Object.values(counts).reduce((prev, jobCount) => jobCount + prev, 0);
+}
+
+export async function getGlobalQueueDepth(): Promise<number> {
+  const activeShopIds = await redis.smembers(ACTIVE_SHOP_QUEUES_KEY);
+
+  let globalJobCount = 0;
+  for (const shopId of activeShopIds) {
+    const queueDepth = await getShopQueueDepth(shopId);
+    globalJobCount += queueDepth;
+  }
+
+  return globalJobCount;
 }

@@ -43,6 +43,7 @@ export const events = pgTable("events", {
   eventType: varchar("event_type", { length: 100 }).notNull(),
   payload: jsonb("payload").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
+  queuedAt: timestamp("queued_at"),
 });
 
 export const deliveryAttempts = pgTable("delivery_attempts", {

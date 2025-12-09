@@ -1,19 +1,18 @@
 {
-  "name": "@sisyphus/producer",
+  "name": "@sisyphus/drain",
   "version": "1.0.0",
   "description": "",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "npx tsx src/index.ts",
-    "seed": "npx tsx src/seed.ts",
-    "flood": "tsx src/flood.ts"
+    "dev": "npx tsx watch src/index.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@sisyphus/shared": "workspace:*",
+    "bullmq": "^5.65.1",
     "drizzle-orm": "^0.45.0"
   },
   "devDependencies": {
