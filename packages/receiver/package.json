@@ -11,7 +11,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "@sisyphus/shared": "workspace:*"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

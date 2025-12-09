@@ -2,14 +2,12 @@ import {
   db,
   events,
   shops,
-  createWebhookQueue,
   addEventToQueue,
-  checkGlobalBackpressureAndUpdateIfStale,
-  checkTenantQueueBackpressure,
+  createLogger,
 } from "@sisyphus/shared";
 import { randomUUID } from "crypto";
 
-const queue = createWebhookQueue();
+const logger = createLogger("producer");
 
 function generateFakeOrder() {
   return {
@@ -32,42 +30,17 @@ function generateFakeOrder() {
   };
 }
 
-async function queueEvent(
-  event: Omit<typeof events.$inferSelect, "id" | "createdAt" | "queuedAt">
-) {
+async function produceEvent(shopId: string) {
   const [dbEvent] = await db
     .insert(events)
     .values({
-      ...event,
-      queuedAt: null,
+      shopId,
+      eventType: "order.created",
+      payload: generateFakeOrder(),
     })
     .returning();
 
-  if (await checkGlobalBackpressureAndUpdateIfStale()) {
-    // global backpressure, skip
-    console.log(
-      `global backpressure active, skipping queue for event ${dbEvent.id}`
-    );
-    return;
-  }
-
-  if (await checkTenantQueueBackpressure(dbEvent.shopId)) {
-    // tenant backpressure, skip
-    console.log(
-      `tenant backpressure active for shop ${dbEvent.shopId}, skipping queue for event ${dbEvent.id}`
-    );
-    return;
-  }
-
-  await addEventToQueue(dbEvent);
-}
-
-async function produceEvent(shopId: string) {
-  await queueEvent({
-    shopId,
-    eventType: "order.created",
-    payload: generateFakeOrder(),
-  });
+  await addEventToQueue(dbEvent, logger);
 }
 
 async function main() {
@@ -78,14 +51,18 @@ async function main() {
     const allShops = await db.select().from(shops);
 
     if (allShops.length === 0) {
-      console.log("no shops exist yet. run the seed script first.");
+      logger.warn("No shops exist yet. run the seed script first.");
     } else {
-      console.log("usage: pnpm dev <shopId> [count]\n");
-      console.log("available shops:");
-      allShops.forEach((s) => console.log(`  ${s.id} - ${s.name}`));
+      logger.info(
+        {
+          availableShops: allShops.forEach((s) =>
+            console.log(`  ${s.id} - ${s.name}`)
+          ),
+        },
+        "usage: pnpm dev <shopId> [count]"
+      );
     }
 
-    await queue.close();
     process.exit(0);
   }
 
@@ -93,9 +70,8 @@ async function main() {
     await produceEvent(shopId);
   }
 
-  console.log(`\nproduced ${count} event(s)`);
+  logger.info({ count }, `Produced event(s)`);
 
-  await queue.close();
   process.exit(0);
 }
 

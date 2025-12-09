@@ -1,5 +1,7 @@
+import pino from "pino";
 import { redis } from "./connection";
 import { getGlobalQueueDepth, getShopQueueDepth } from "./shopQueues";
+import { sharedLogger } from "../logging";
 
 const GLOBAL_BACKPRESSURE_ACTIVE_REDIS_KEY = "backpressure:global:active";
 const GLOBAL_BACKPRESSURE_CHECKED_AT_REDIS_KEY =
@@ -20,7 +22,7 @@ const TENANT_BACKPRESSURE_DEPTH_RESOLUTION =
  * function for checking the redis status of global backpressure
  * @returns boolean indicating whether or not backpressure is active
  */
-async function isGlobalBackpressureActive(): Promise<boolean> {
+export async function isGlobalBackpressureActive(): Promise<boolean> {
   return !!(await redis.exists(GLOBAL_BACKPRESSURE_ACTIVE_REDIS_KEY));
 }
 
@@ -28,7 +30,9 @@ async function isGlobalBackpressureActive(): Promise<boolean> {
  * function for updating the redis status of global backpressure
  * @returns boolean indicating whether or not backpressure is active after this update
  */
-export async function updateGlobalBackpressureState(): Promise<boolean> {
+export async function updateGlobalBackpressureState(
+  logger: pino.BaseLogger = sharedLogger
+): Promise<boolean> {
   const globalBackPressureActive = await isGlobalBackpressureActive();
   const globalJobDepth = await getGlobalQueueDepth();
 
@@ -40,7 +44,13 @@ export async function updateGlobalBackpressureState(): Promise<boolean> {
     // activate global backpressure mode
     await redis.set(GLOBAL_BACKPRESSURE_ACTIVE_REDIS_KEY, "1");
     returnBackpressureStatus = true;
-    console.log("global backpressure activated, depth:", globalJobDepth);
+    logger.warn(
+      {
+        backpressureActive: true,
+        jobDepth: globalJobDepth,
+      },
+      "Global backpressure activated"
+    );
   } else if (
     globalBackPressureActive &&
     globalJobDepth < GLOBAL_BACKPRESSURE_DEPTH_RESOLUTION
@@ -48,7 +58,13 @@ export async function updateGlobalBackpressureState(): Promise<boolean> {
     // deactivate
     await redis.del(GLOBAL_BACKPRESSURE_ACTIVE_REDIS_KEY);
     returnBackpressureStatus = false;
-    console.log("global backpressure deactivated, depth:", globalJobDepth);
+    logger.warn(
+      {
+        backpressureActive: false,
+        jobDepth: globalJobDepth,
+      },
+      "Global backpressure deactivated"
+    );
   }
 
   await redis.set(GLOBAL_BACKPRESSURE_CHECKED_AT_REDIS_KEY, Date.now());
@@ -59,7 +75,9 @@ export async function updateGlobalBackpressureState(): Promise<boolean> {
  * function for checking global backpressure status and updating if it's stale
  * @returns boolean indicating whether or not backpressure is active
  */
-export async function checkGlobalBackpressureAndUpdateIfStale(): Promise<boolean> {
+export async function checkGlobalBackpressureAndUpdateIfStale(
+  logger: pino.BaseLogger = sharedLogger
+): Promise<boolean> {
   const lastCalculated = await redis.get(
     GLOBAL_BACKPRESSURE_CHECKED_AT_REDIS_KEY
   );
@@ -71,7 +89,7 @@ export async function checkGlobalBackpressureAndUpdateIfStale(): Promise<boolean
     Date.now() - parseInt(lastCalculated) >= GLOBAL_BACKPRESSURE_STALENESS_MS
   ) {
     // stale, update global backpressure state
-    return updateGlobalBackpressureState();
+    return updateGlobalBackpressureState(logger);
   } else {
     // not stale, return cached val
     return globalBackPressureActive;
@@ -84,7 +102,8 @@ export async function checkGlobalBackpressureAndUpdateIfStale(): Promise<boolean
  * @returns boolean representing whether or not tenant queue backpressure mode is active
  */
 export async function checkTenantQueueBackpressure(
-  shopId: string
+  shopId: string,
+  logger: pino.BaseLogger = sharedLogger
 ): Promise<boolean> {
   const tenantBackpressureKey = tenantBackpressureRedisKey(shopId);
   const tenantBackPressureActive = !!(await redis.exists(
@@ -98,12 +117,28 @@ export async function checkTenantQueueBackpressure(
   ) {
     // activate
     await redis.set(tenantBackpressureKey, "1");
+    logger.warn(
+      {
+        shopId,
+        backpressureActive: true,
+        jobDepth: tenantJobDepth,
+      },
+      "Tenant backpressure activated"
+    );
     return true;
   } else if (
     tenantBackPressureActive &&
     tenantJobDepth < TENANT_BACKPRESSURE_DEPTH_RESOLUTION
   ) {
     await redis.del(tenantBackpressureKey);
+    logger.warn(
+      {
+        shopId,
+        backpressureActive: false,
+        jobDepth: tenantJobDepth,
+      },
+      "Tenant backpressure deactivated"
+    );
     return false;
   } else {
     return tenantBackPressureActive;

@@ -5,4 +5,7 @@ export * from "./queue/shopQueues";
 export * from "./queue/shopWorkers";
 export * from "./queue/backpressure";
 export * from "./queue/addToQueue";
+export * from "./logging";
+export * from "./metrics";
 export * from "./types";
+export * from "./shops";

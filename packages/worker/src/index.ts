@@ -15,28 +15,40 @@ import {
   getOrCreateShopQueue,
   updateLatestActivityForWorker,
   cleanupStaleWorkers,
+  createLogger,
+  recordAttempt,
+  recordAttemptSuccess,
+  recordDeliveryMarkedDead,
+  recordDeliverySuccess,
+  recordE2ELatency,
 } from "@sisyphus/shared";
-import { and, eq, gt, or } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+
+const workerId = process.env.WORKER_ID ?? `worker-${process.pid}`;
+const logger = createLogger(`worker-${workerId}`);
 
 async function processWebhook(
   job: Job<WebhookJobData>,
   token: string | undefined
 ) {
-  const { eventId, shopId, registrationId } = job.data;
+  const { eventId, registrationId } = job.data;
 
-  console.log(`processing job ${job.id} for event ${eventId}`);
+  logger.info({ eventId, registrationId }, "Processing job");
 
   const circuitOpen = await redis.exists(`circuit:open:${registrationId}`);
   if (circuitOpen === 1) {
     await job.moveToDelayed(Date.now() + CIRCUIT_COOLDOWN_MS, token);
-    console.log(`circuit open for ${registrationId}, delaying job`);
+    logger.info({ eventId, registrationId }, "Circuit open, delaying job");
     throw new DelayedError(`circuit open for ${registrationId}, delaying job`);
   }
 
   const [event] = await db.select().from(events).where(eq(events.id, eventId));
 
   if (!event) {
-    console.error(`event ${eventId} not found, skipping`);
+    logger.error(
+      { eventId, registrationId },
+      `Event ${eventId} not found, skipping`
+    );
     return;
   }
 
@@ -47,16 +59,18 @@ async function processWebhook(
 
   // registration not found, skip
   if (!registration) {
-    console.warn(
-      `received job for event ${event.id} but registration ${registrationId} doesn't exist - skipping`
+    logger.warn(
+      { eventId, registrationId },
+      `Registration ${registrationId} doesn't exist - skipping`
     );
     return;
   }
 
   if (!registration.events.includes(event.eventType)) {
     // should not happen, producer should not add to the queue. warn
-    console.warn(
-      `received job for event type ${event.eventType} but registration ${registration.id} doesn't subscribe to it - skipping`
+    logger.warn(
+      { eventId, registrationId },
+      `Received event type ${event.eventType} but registration doesn't subscribe to it - skipping`
     );
     return;
   }
@@ -68,8 +82,6 @@ async function deliverWebhook(
   event: typeof events.$inferSelect,
   registration: typeof webhookRegistrations.$inferSelect
 ) {
-  console.log(`delivering to ${registration.targetUrl}`);
-
   let attempt: typeof deliveryAttempts.$inferSelect;
 
   const existingAttempt = await db.query.deliveryAttempts.findFirst({
@@ -104,7 +116,9 @@ async function deliverWebhook(
   };
 
   let response: Response;
+  const timeBeforeFetch = Date.now();
   try {
+    recordAttempt();
     response = await fetch(registration.targetUrl, {
       method: "POST",
       headers: {
@@ -134,16 +148,37 @@ async function deliverWebhook(
       await openCircuitForRegistration(registration.id);
     }
 
+    logger.warn(
+      {
+        eventId: event.id,
+        registrationId: registration.id,
+        shopId: event.shopId,
+        targetUrl: registration.targetUrl,
+        attempt: newAttempts,
+        maxAttempts: MAX_RETRIES,
+        latencyMs: Date.now() - timeBeforeFetch,
+        error: {
+          name: error instanceof Error ? error.name : "Unexpected error",
+          message: error instanceof Error ? error.message : "Unexpected error",
+        },
+      },
+      newAttempts === MAX_RETRIES
+        ? "Delivery error, max retries used. Moved to dead"
+        : `Delivery error`
+    );
+
     throw new Error(`delivery error: ${errMessage}`);
   }
 
   const newAttempts = attempt.attempts + 1;
+  const latencyMS = Date.now() - timeBeforeFetch;
 
   if (!response.ok) {
+    const moveToDead = newAttempts === MAX_RETRIES;
     await db
       .update(deliveryAttempts)
       .set({
-        status: newAttempts === MAX_RETRIES ? "dead" : "failed",
+        status: moveToDead ? "dead" : "failed",
         responseCode: response.status,
         responseBody: await response.text(),
         lastAttemptAt: new Date(),
@@ -154,6 +189,27 @@ async function deliverWebhook(
     const recentFailCount = await incrementFailCount(registration.id);
     if (recentFailCount >= CIRCUIT_ERROR_LIMIT) {
       await openCircuitForRegistration(registration.id);
+    }
+
+    logger.warn(
+      {
+        eventId: event.id,
+        registrationId: registration.id,
+        shopId: event.shopId,
+        responseCode: response.status,
+        targetUrl: registration.targetUrl,
+        attempt: newAttempts,
+        maxAttempts: MAX_RETRIES,
+        latencyMs: latencyMS,
+      },
+      moveToDead
+        ? "Delivery failed, max retries used. Moved to dead"
+        : `Delivery failed`
+    );
+
+    if (moveToDead) {
+      recordDeliveryMarkedDead();
+      recordE2ELatency(Date.now() - event.createdAt.getTime());
     }
 
     throw new Error(`delivery failed with status ${response.status}`);
@@ -168,8 +224,25 @@ async function deliverWebhook(
         attempts: newAttempts,
       })
       .where(eq(deliveryAttempts.id, attempt.id));
+
+    recordAttemptSuccess();
+    recordDeliverySuccess();
+    recordE2ELatency(Date.now() - event.createdAt.getTime());
   }
-  console.log(`delivered successfully to ${registration.targetUrl}`);
+
+  logger.info(
+    {
+      eventId: event.id,
+      registrationId: registration.id,
+      shopId: event.shopId,
+      responseCode: response.status,
+      targetUrl: registration.targetUrl,
+      attempt: newAttempts,
+      maxAttempts: MAX_RETRIES,
+      latencyMs: latencyMS,
+    },
+    `Delivered successfully`
+  );
 }
 
 async function incrementFailCount(registrationId: string): Promise<number> {
@@ -186,27 +259,26 @@ async function incrementFailCount(registrationId: string): Promise<number> {
 }
 
 async function openCircuitForRegistration(registrationId: string) {
-  console.log(`circuit breaker tripped for registration ${registrationId}`);
   await redis.set(
     `circuit:open:${registrationId}`,
     "1",
     "EX",
     CIRCUIT_COOLDOWN_MS / 1000
   );
+  logger.warn({ registrationId }, `Circuit breaker tripped`);
 }
 
 async function runWorker() {
-  console.log("worker started, waiting for jobs...");
+  logger.info("Started, waiting for jobs");
 
   let currentIteration = 0;
-  const workerToken = "worker-1"; // will need to update token for multiple workers
+  const workerToken = workerId;
 
   while (true) {
     const activeShops = await redis.smembers(ACTIVE_SHOP_QUEUES_KEY);
-
     if (activeShops.length === 0) {
       // simple sleep while waiting for active jobs
-      await new Promise((resolve) => setTimeout(resolve, 2500));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       continue;
     }
 
@@ -220,6 +292,7 @@ async function runWorker() {
       if (counts.waiting === 0 && counts.active === 0 && counts.delayed === 0) {
         await redis.srem(ACTIVE_SHOP_QUEUES_KEY, shopId);
       }
+      currentIteration++;
       continue;
     } else {
       updateLatestActivityForWorker(shopId, Date.now());
@@ -230,6 +303,7 @@ async function runWorker() {
       } catch (e: unknown) {
         if (e instanceof DelayedError) {
           // skip, this job has been delayed
+          currentIteration++;
           continue;
         } else {
           const err =

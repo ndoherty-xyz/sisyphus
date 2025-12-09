@@ -1,19 +1,22 @@
 import {
   addEventToQueue,
   checkTenantQueueBackpressure,
+  createLogger,
   db,
   events,
   updateGlobalBackpressureState,
 } from "@sisyphus/shared";
 import { and, asc, eq, isNull } from "drizzle-orm";
 
+const logger = createLogger("drain");
+
 async function runBackpressureDrainLoop() {
-  console.log("backpressure drain system started...");
+  logger.info("Backpressure drain system started...");
 
   let currentIteration = 0;
 
   while (true) {
-    const globalBackpressure = await updateGlobalBackpressureState();
+    const globalBackpressure = await updateGlobalBackpressureState(logger);
 
     if (globalBackpressure) {
       // busy loop, sleep a second
@@ -48,10 +51,11 @@ async function runBackpressureDrainLoop() {
       .limit(1);
 
     if (!eventToQueue) {
+      currentIteration++;
       continue;
     }
 
-    await addEventToQueue(eventToQueue);
+    await addEventToQueue(eventToQueue, logger);
     currentIteration++;
   }
 }

@@ -1,0 +1,24 @@
+{
+  "name": "@sisyphus/dashboard",
+  "version": "1.0.0",
+  "description": "",
+  "bin": "dist/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "pnpm build && node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/react": "^18.0.32",
+    "ink": "^4.1.0",
+    "react": "^18.2.0",
+    "@sisyphus/shared": "workspace:*"
+  }
+}
